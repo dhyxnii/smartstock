@@ -63,6 +63,26 @@ def render_sidebar() -> Dict[str, Any]:
         )
         st.divider()
 
+        # ── Navigation buttons ────────────────────────────────────────
+        active = st.session_state.get("active_page", "dashboard")
+
+        if st.button("📡  API Docs", use_container_width=True,
+                     type="primary" if active == "api_docs" else "secondary"):
+            st.session_state["active_page"] = "api_docs"
+            st.rerun()
+
+        if st.button("📚  References", use_container_width=True,
+                     type="primary" if active == "references" else "secondary"):
+            st.session_state["active_page"] = "references"
+            st.rerun()
+
+        if active in ("api_docs", "references"):
+            if st.button("←  Back to Dashboard", use_container_width=True):
+                st.session_state["active_page"] = "dashboard"
+                st.rerun()
+
+        st.divider()
+
         # ── 1. Data Upload ──────────────────────────────────────────────────
         st.markdown("**📂 DATA UPLOAD**")
         uploaded = st.file_uploader(
@@ -110,13 +130,71 @@ def render_sidebar() -> Dict[str, Any]:
                     """,
                     unsafe_allow_html=True,
                 )
-                items = df_raw["item_id"].astype(str).tolist()
-                selected_item = st.selectbox("📦 Select Item to Forecast", items, index=0)
+
+                has_category = "category" in df_raw.columns
+                has_item_name = "item_name" in df_raw.columns
+
+                if has_category:
+                    # ── Category → Item hierarchical selection ──────────────
+                    categories = sorted(df_raw["category"].dropna().unique().tolist())
+                    selected_category = st.selectbox(
+                        "🏷️ CATEGORY", categories, index=0,
+                        label_visibility="visible"
+                    )
+                    cfg["abc_selected_category"] = selected_category
+
+                    cat_df = df_raw[df_raw["category"] == selected_category]
+
+                    # Build display label: "Item Name (SKU-XXX)" or just item_id
+                    if has_item_name:
+                        item_labels = [
+                            f"{row['item_name']} ({row['item_id']})"
+                            for _, row in cat_df.iterrows()
+                        ]
+                        item_ids = cat_df["item_id"].astype(str).tolist()
+                        label_to_id = dict(zip(item_labels, item_ids))
+                    else:
+                        item_labels = cat_df["item_id"].astype(str).tolist()
+                        label_to_id = dict(zip(item_labels, item_labels))
+
+                    selected_label = st.selectbox(
+                        "📦 ITEM", item_labels, index=0,
+                        label_visibility="visible"
+                    )
+                    selected_item = label_to_id[selected_label]
+
+                    # Show expandable list of all items in category
+                    with st.expander(f"▶  Items in selected category", expanded=False):
+                        for lbl in item_labels:
+                            st.markdown(
+                                f"<div style='font-size:.8rem; color:#cbd5e1; padding:.15rem 0;'>• {lbl}</div>",
+                                unsafe_allow_html=True,
+                            )
+                else:
+                    # No category column — flat list
+                    if has_item_name:
+                        item_labels = [
+                            f"{row['item_name']} ({row['item_id']})"
+                            for _, row in df_raw.iterrows()
+                        ]
+                        item_ids = df_raw["item_id"].astype(str).tolist()
+                        label_to_id = dict(zip(item_labels, item_ids))
+                    else:
+                        item_labels = df_raw["item_id"].astype(str).tolist()
+                        label_to_id = dict(zip(item_labels, item_labels))
+                    selected_label = st.selectbox("📦 ITEM", item_labels, index=0)
+                    selected_item = label_to_id[selected_label]
+                    selected_category = None
+                    cfg["abc_selected_category"] = None
+
                 cfg["abc_selected_item"] = selected_item
-                # expose annual_demand + unit_cost for the selected item
+
+                # Expose annual_demand + unit_cost + item_name for the selected item
                 row = df_raw[df_raw["item_id"].astype(str) == selected_item].iloc[0]
                 cfg["abc_annual_demand"] = float(row["annual_demand"])
                 cfg["abc_unit_cost"] = float(row["unit_cost"])
+                if has_item_name:
+                    cfg["abc_item_name"] = str(row["item_name"])
                 # Treat as a synthetic single series so all tabs unlock
                 cfg["data_mode"] = "abc_synthetic"
 
@@ -221,6 +299,11 @@ def _parse_upload(uploaded_file) -> tuple[Optional[pd.DataFrame], Optional[str]]
         return df, "single_series"
 
     if {"item_id", "unit_cost", "annual_demand"}.issubset(cols):
+        # Normalise category and item_name columns if present
+        if "category" in cols:
+            df["category"] = df["category"].astype(str).str.strip()
+        if "item_name" in cols:
+            df["item_name"] = df["item_name"].astype(str).str.strip()
         return df, "abc_only"
 
     return df, "unknown"

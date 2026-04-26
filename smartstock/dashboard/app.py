@@ -33,8 +33,10 @@ st.set_page_config(
 
 # ── Imports ──────────────────────────────────────────────────────────────────
 from smartstock.dashboard.components.abc_view import render_abc_view
+from smartstock.dashboard.components.api_docs_view import render_api_docs_view
 from smartstock.dashboard.components.forecast_view import render_forecast_view
 from smartstock.dashboard.components.optimization_view import render_optimization_view
+from smartstock.dashboard.components.references_view import render_references_view
 from smartstock.dashboard.components.sidebar import render_sidebar
 
 
@@ -203,6 +205,15 @@ def main() -> None:
 
     # ── Sidebar (returns config dict) ─────────────────────────────────────
     cfg = render_sidebar()
+
+    # ── Full-page navigation views (sidebar buttons) ─────────────────────
+    active_page = st.session_state.get("active_page", "dashboard")
+    if active_page == "api_docs":
+        render_api_docs_view()
+        return
+    if active_page == "references":
+        render_references_view()
+        return
 
     # ── Guard: nothing uploaded yet ───────────────────────────────────────
     if cfg["df_raw"] is None:

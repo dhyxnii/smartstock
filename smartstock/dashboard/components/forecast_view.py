@@ -1,5 +1,5 @@
 """
-Forecast view: Trains models via ForecastManager and renders interactive
+Forecast view: Calls the SmartStock API (/api/forecast) and renders interactive
 Plotly charts with confidence intervals, plus MAE/RMSE metric cards.
 """
 
@@ -12,12 +12,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from smartstock.data.cleaner import clean_series
-from smartstock.data.loader import filter_series
-from smartstock.forecasting.forecast_manager import ForecastManager
-from smartstock.forecasting.prophet_forecaster import ProphetForecaster
-from smartstock.forecasting.sarima_forecaster import SARIMAForecaster
-
+from smartstock.dashboard.api_client import call_forecast
 
 _MODEL_COLORS = {
     "Prophet": "#636EFA",
@@ -25,24 +20,39 @@ _MODEL_COLORS = {
 }
 
 
-def render_forecast_view(cfg: Dict[str, Any]) -> None:
-    """
-    Entry-point called by app.py for the Forecasting tab.
+@st.cache_data(show_spinner=False, ttl=1800)
+def _cached_call_forecast(
+    item_key,
+    records: tuple,
+    models: tuple,
+    forecast_horizon: int,
+    test_split_frac: float,
+):
+    """Cache forecast API results by item + params. Same inputs = instant response."""
+    cfg_proxy = {
+        "models": list(models),
+        "forecast_horizon": forecast_horizon,
+        "test_split_frac": test_split_frac,
+    }
+    records_list = [{"date": d, "sales": s} for d, s in records]
+    return call_forecast(cfg_proxy, records_list)
 
-    Parameters
-    ----------
-    cfg : dict returned by sidebar.render_sidebar()
-    """
+
+def render_forecast_view(cfg: Dict[str, Any]) -> None:
     st.markdown('<div class="section-pill">📈 &nbsp;Demand Forecasting</div>', unsafe_allow_html=True)
 
     if cfg.get("data_mode") == "abc_synthetic":
         item_id = cfg.get("abc_selected_item", "")
+        item_name = cfg.get("abc_item_name", "")
         annual_demand = cfg.get("abc_annual_demand", 0)
+        selected_category = cfg.get("abc_selected_category", "")
+        display = f"**{item_name}** ({item_id})" if item_name and item_name != item_id else f"**{item_id}**"
+        context_text = f" in {selected_category}" if selected_category else ""
         st.info(
-            f"🤖 **Auto-generated forecast** for **{item_id}** — "
-            f"SmartStock synthesised 2 years of realistic daily sales history "
-            f"from its annual demand of **{int(annual_demand):,} units/year**. "
-            f"Forecasting and optimisation are now fully active."
+            f"🤖 **Auto-generated forecast** for {display}{context_text} — "
+            f"SmartStock synthesized 1 year of realistic daily sales history "
+            f"from annual demand of **{int(annual_demand):,} units/year**. "
+            f"Forecasting and optimization are now fully active."
         )
 
     series = _prepare_series(cfg)
@@ -65,74 +75,88 @@ def render_forecast_view(cfg: Dict[str, Any]) -> None:
         )
         return
 
-    train = series.iloc[:train_n]
-    test = series.iloc[train_n:]
-
     st.caption(
-        f"Training on **{train_n}** days  ·  Testing on **{test_n}** days  ·  "
+        f"Training on **{train_n}** days  ·  Testing on **{n - train_n}** days  ·  "
         f"Forecasting **{cfg['forecast_horizon']}** days ahead"
     )
 
-    with st.spinner("🧠 Training models — this may take a moment…"):
-        manager, errors = _build_and_train(cfg["models"], train)
+    records_df = series.reset_index()
+    date_col = records_df.columns[0]
+    records = tuple(
+        (str(pd.to_datetime(row[date_col]).date()), float(row["sales"]))
+        for _, row in records_df.iterrows()
+    )
 
-    if errors:
-        for e in errors:
-            st.warning(e)
-
-    if not manager.models:
-        st.error("All models failed to train. Check warnings above.")
-        return
-
-    # ── Predictions ───────────────────────────────────────────────────────
-    with st.spinner("Generating forecasts…"):
-        predictions = manager.predict_all(
-            periods=cfg["forecast_horizon"], include_history=True
+    with st.spinner("🧠 Training models via API — this may take a moment…"):
+        response = _cached_call_forecast(
+            item_key=cfg.get("abc_selected_item") or str(cfg.get("store_id", "")),
+            records=records,
+            models=tuple(cfg.get("models", ["Prophet"])),
+            forecast_horizon=cfg["forecast_horizon"],
+            test_split_frac=cfg["test_split_frac"],
         )
 
-    if not predictions:
-        st.error("No predictions returned.")
+    if response is None:
         return
 
-    # ── Chart ─────────────────────────────────────────────────────────────
-    fig = _build_forecast_chart(series, predictions, train_n)
+    raw_predictions = response.get("predictions", {})
+    raw_metrics = response.get("metrics", {})
+    train_cutoff_date = response.get("train_cutoff_date")
+
+    if not raw_predictions:
+        st.error("No predictions returned from the API.")
+        return
+
+    predictions: Dict[str, pd.DataFrame] = {}
+    for model_name, points in raw_predictions.items():
+        rows = []
+        for p in points:
+            rows.append({
+                "date": pd.to_datetime(p["date"]),
+                "forecast": p["forecast"],
+                "ci_lower": p.get("ci_lower"),
+                "ci_upper": p.get("ci_upper"),
+            })
+        pred_df = pd.DataFrame(rows).set_index("date")
+        predictions[model_name] = pred_df
+
+    train_cutoff_idx = train_n
+    if train_cutoff_date:
+        cutoff_ts = pd.Timestamp(train_cutoff_date)
+        matches = [i for i, ts in enumerate(series.index) if ts <= cutoff_ts]
+        if matches:
+            train_cutoff_idx = matches[-1] + 1
+
+    fig = _build_forecast_chart(series, predictions, train_cutoff_idx)
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Metrics ──────────────────────────────────────────────────────────
-    if not test.empty:
+    if raw_metrics:
         st.markdown('<div class="section-pill">📊 &nbsp;Model Accuracy on Test Period</div>', unsafe_allow_html=True)
-        try:
-            metrics_df = manager.compare_models(test)
-            _render_metric_cards(metrics_df)
-            _render_metrics_table(metrics_df)
-        except Exception as exc:
-            st.warning(f"Could not compute metrics: {exc}")
+        _render_metric_cards(raw_metrics)
+        _render_metrics_table(raw_metrics)
 
-    # ── Raw JSON toggle ──────────────────────────────────────────────────
     with st.expander("🔍 Raw Forecast Data (Developer View)", expanded=False):
         for model_name, pred_df in predictions.items():
             st.markdown(f"**{model_name}**")
             st.dataframe(pred_df.tail(cfg["forecast_horizon"] + 5), use_container_width=True)
 
-    # Expose series for other tabs via session state
-    st.session_state["train_series"] = train
-    st.session_state["test_series"] = test
+    st.session_state["train_series"] = series.iloc[:train_cutoff_idx]
+    st.session_state["test_series"] = series.iloc[train_cutoff_idx:]
     st.session_state["predictions"] = predictions
-    st.session_state["manager"] = manager
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
+    st.session_state["raw_predictions"] = raw_predictions
+    st.session_state["train_cutoff_date"] = train_cutoff_date
 
 
 def _prepare_series(cfg: Dict[str, Any]) -> pd.DataFrame | None:
-    """Return a cleaned sales DataFrame with DatetimeIndex & 'sales' column."""
+    from smartstock.data.cleaner import clean_series
+    from smartstock.data.loader import filter_series
+
     mode = cfg.get("data_mode")
     df_raw = cfg.get("df_raw")
 
     if mode is None:
         return None
 
-    # ── Auto-generate from ABC annual_demand ─────────────────────────────
     if mode == "abc_synthetic":
         annual_demand = cfg.get("abc_annual_demand")
         item_id = cfg.get("abc_selected_item", "item")
@@ -163,31 +187,35 @@ def _prepare_series(cfg: Dict[str, Any]) -> pd.DataFrame | None:
         return None
 
 
-def _generate_series_from_annual_demand(
-    annual_demand: float, item_id: str
-) -> pd.DataFrame:
-    """
-    Synthesise 2 years of daily sales history from an annual demand figure.
-    Adds realistic weekly seasonality, noise, and a slight growth trend.
-    """
+@st.cache_data(show_spinner=False, ttl=3600)
+def _generate_series_from_annual_demand(annual_demand: float, item_id: str) -> pd.DataFrame:
     rng = np.random.default_rng(seed=abs(hash(item_id)) % (2**31))
+    # 2 full years: gives Prophet enough repetitions of yearly + weekly cycles
+    # to learn seasonality properly and generalise to the held-out test split
     n_days = 730
-    dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=n_days, freq="D")
+    dates = pd.date_range(end=pd.Timestamp(2025, 1, 1), periods=n_days, freq="D")
 
     base_daily = annual_demand / 365.0
+    day_idx = np.arange(n_days, dtype=float)
 
-    # Weekly seasonality: weekdays slightly higher than weekends (retail pattern)
-    day_of_week = np.array([d.dayofweek for d in dates], dtype=float)
-    seasonality = np.where(day_of_week < 5, 1.10, 0.75)  # weekday vs weekend
+    # Weekly seasonality: weekdays +20%, weekends -30%
+    dow = np.array([d.dayofweek for d in dates], dtype=float)  # 0=Mon, 6=Sun
+    weekly = np.where(dow < 5, 1.20, 0.70)
 
-    # Slight upward growth trend (+5% over 2 years)
-    trend = 1.0 + 0.05 * np.linspace(0, 1, n_days)
+    # Monthly seasonality: smooth sine wave, ±12% (peaks mid-month)
+    monthly = 1.0 + 0.12 * np.sin(2 * np.pi * day_idx / 30.44)
 
-    # Random noise (±25%)
-    noise = rng.normal(loc=1.0, scale=0.15, size=n_days)
-    noise = np.clip(noise, 0.5, 1.8)
+    # Yearly seasonality: ±18% (peaks Nov-Dec, troughs Jan-Feb)
+    yearly = 1.0 + 0.18 * np.sin(2 * np.pi * (day_idx / 365.25) - np.pi / 2)
 
-    sales = base_daily * seasonality * trend * noise
+    # Gentle upward trend: +8% over 2 years
+    trend = 1.0 + 0.08 * np.linspace(0, 1, n_days)
+
+    # Low noise: ±8% std, clipped to ±20% — enough variation without hiding signal
+    noise = rng.normal(loc=1.0, scale=0.08, size=n_days)
+    noise = np.clip(noise, 0.80, 1.20)
+
+    sales = base_daily * weekly * monthly * yearly * trend * noise
     sales = np.maximum(0, np.round(sales, 1))
 
     series = pd.DataFrame({"sales": sales}, index=dates)
@@ -195,43 +223,13 @@ def _generate_series_from_annual_demand(
     return series
 
 
-def _build_and_train(
-    model_names: list[str], train: pd.DataFrame
-) -> tuple[ForecastManager, list[str]]:
-    """Instantiate, register and train all requested models."""
-    manager = ForecastManager()
-    errors: list[str] = []
-
-    for name in model_names:
-        try:
-            if name == "Prophet":
-                model = ProphetForecaster()
-            elif name == "SARIMA":
-                model = SARIMAForecaster()
-            else:
-                errors.append(f"Unknown model: {name}")
-                continue
-            manager.add_model(name, model)
-        except Exception as exc:
-            errors.append(f"Could not add {name}: {exc}")
-
-    try:
-        manager.train_all(train)
-    except Exception as exc:
-        errors.append(f"Training failed: {exc}")
-
-    return manager, errors
-
-
 def _build_forecast_chart(
     full_series: pd.DataFrame,
     predictions: Dict[str, pd.DataFrame],
     train_cutoff_idx: int,
 ) -> go.Figure:
-    """Construct the interactive Plotly forecast chart."""
     fig = go.Figure()
 
-    # ── Actual history ──
     fig.add_trace(
         go.Scatter(
             x=full_series.index,
@@ -242,32 +240,32 @@ def _build_forecast_chart(
         )
     )
 
-    # ── Train / test split line ──
-    # add_vline with annotation crashes in plotly 6.x (tries to sum x-axis values).
-    # Use add_shape (xref="x") + add_annotation instead.
     if train_cutoff_idx < len(full_series):
         split_date = full_series.index[train_cutoff_idx].isoformat()
         fig.add_shape(
             type="line",
-            x0=split_date, x1=split_date,
-            y0=0, y1=1,
-            xref="x", yref="paper",
+            x0=split_date,
+            x1=split_date,
+            y0=0,
+            y1=1,
+            xref="x",
+            yref="paper",
             line=dict(width=1.5, dash="dash", color="grey"),
         )
         fig.add_annotation(
-            x=split_date, xref="x",
-            y=1, yref="paper",
+            x=split_date,
+            xref="x",
+            y=1,
+            yref="paper",
             text="Train | Test",
             showarrow=False,
             xanchor="left",
             font=dict(color="grey", size=11),
         )
 
-    # ── Model forecasts ──
     for model_name, pred_df in predictions.items():
         color = _MODEL_COLORS.get(model_name, "#7F7F7F")
 
-        # Future-only portion of forecast line
         future_mask = pred_df.index > full_series.index[-1]
         past_mask = ~future_mask
 
@@ -294,24 +292,24 @@ def _build_forecast_chart(
                 )
             )
 
-            # Confidence bands
             if "ci_upper" in pred_df.columns and "ci_lower" in pred_df.columns:
-                ci_upper = pred_df.loc[future_mask, "ci_upper"].fillna(y_future)
-                ci_lower = pred_df.loc[future_mask, "ci_lower"].fillna(y_future)
+                ci_frame = pred_df.loc[future_mask, ["ci_upper", "ci_lower"]].copy()
+                y_future_vals = np.asarray(y_future, dtype=float)
+                ci_upper_vals = np.asarray(pd.to_numeric(ci_frame["ci_upper"], errors="coerce"), dtype=float)
+                ci_lower_vals = np.asarray(pd.to_numeric(ci_frame["ci_lower"], errors="coerce"), dtype=float)
+
+                ci_upper_vals = np.where(np.isnan(ci_upper_vals), y_future_vals, ci_upper_vals)
+                ci_lower_vals = np.where(np.isnan(ci_lower_vals), y_future_vals, ci_lower_vals)
+                x_future = pred_df.index[future_mask]
 
                 fig.add_trace(
                     go.Scatter(
-                        x=pd.concat(
-                            [
-                                pd.Series(pred_df.index[future_mask]),
-                                pd.Series(pred_df.index[future_mask][::-1]),
-                            ]
-                        ),
-                        y=pd.concat([ci_upper, ci_lower.iloc[::-1]]),
+                        x=list(x_future) + list(x_future[::-1]),
+                        y=list(ci_upper_vals) + list(ci_lower_vals[::-1]),
                         fill="toself",
                         fillcolor=color.replace(")", ", 0.15)").replace("rgb", "rgba")
                         if color.startswith("rgb")
-                        else color + "26",  # ~15% opacity hex
+                        else color + "26",
                         line=dict(color="rgba(255,255,255,0)"),
                         showlegend=True,
                         name=f"{model_name} CI",
@@ -320,36 +318,42 @@ def _build_forecast_chart(
                 )
 
     fig.update_layout(
-        title="Sales History & Demand Forecast",
         xaxis_title="Date",
         yaxis_title="Units Sold",
+        template="plotly_white",
+        height=520,
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        template="plotly_white",
-        height=480,
     )
+
     return fig
 
 
-def _render_metric_cards(metrics_df: pd.DataFrame) -> None:
-    """Render one column of KPI cards per model."""
-    cols = st.columns(len(metrics_df))
-    for col, (model_name, row) in zip(cols, metrics_df.iterrows()):
+def _render_metric_cards(raw_metrics: Dict[str, dict]) -> None:
+    cols = st.columns(len(raw_metrics))
+    for col, (model_name, m) in zip(cols, raw_metrics.items()):
         with col:
             st.markdown(f"**{model_name}**")
             m1, m2 = st.columns(2)
-            m1.metric("MAE", f"{row.get('mae', float('nan')):.2f}")
-            m2.metric("RMSE", f"{row.get('rmse', float('nan')):.2f}")
+            m1.metric("MAE", f"{m.get('mae') or 0:.2f}" if m.get("mae") is not None else "N/A")
+            m2.metric("RMSE", f"{m.get('rmse') or 0:.2f}" if m.get("rmse") is not None else "N/A")
             m3, m4 = st.columns(2)
-            m3.metric("MAPE", f"{row.get('mape', float('nan')):.1f}%")
-            m4.metric("R²", f"{row.get('r2', float('nan')):.3f}")
+            m3.metric("MAPE", f"{m.get('mape') or 0:.1f}%" if m.get("mape") is not None else "N/A")
+            m4.metric("R²", f"{m.get('r2') or 0:.3f}" if m.get("r2") is not None else "N/A")
 
 
-def _render_metrics_table(metrics_df: pd.DataFrame) -> None:
-    """Expandable table showing all metrics."""
+def _render_metrics_table(raw_metrics: Dict[str, dict]) -> None:
     with st.expander("Full metrics table", expanded=False):
-        display = metrics_df.copy()
-        for col in ["mae", "rmse", "mape", "r2"]:
-            if col in display.columns:
-                display[col] = display[col].map(lambda v: f"{v:.4f}")
+        rows = []
+        for model_name, m in raw_metrics.items():
+            rows.append(
+                {
+                    "model": model_name,
+                    "mae": f"{m['mae']:.4f}" if m.get("mae") is not None else "N/A",
+                    "rmse": f"{m['rmse']:.4f}" if m.get("rmse") is not None else "N/A",
+                    "mape": f"{m['mape']:.4f}" if m.get("mape") is not None else "N/A",
+                    "r2": f"{m['r2']:.4f}" if m.get("r2") is not None else "N/A",
+                }
+            )
+        display = pd.DataFrame(rows).set_index("model")
         st.dataframe(display, use_container_width=True)
